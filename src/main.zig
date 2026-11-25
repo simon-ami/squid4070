@@ -13,14 +13,28 @@ const bench_runs_max: usize = 64;
 const cli_tokens_max: usize = 1_048_576;
 
 pub fn main(init: std.process.Init.Minimal) u8 {
-    const argv = init.args.vector;
+    const raw_arg_buf = tiger.alloc_host_zeroed(u8, 256 * 1024);
+    defer tiger.free_host_slice(u8, raw_arg_buf);
+    var arg_fba = std.heap.FixedBufferAllocator.init(raw_arg_buf);
+    var arg_it = std.process.Args.Iterator.initAllocator(init.args, arg_fba.allocator()) catch {
+        print_usage();
+        return 1;
+    };
+    var argv_storage: [256][:0]const u8 = undefined;
+    var argv_len: usize = 0;
+    while (arg_it.next()) |a| {
+        if (argv_len >= argv_storage.len) break;
+        argv_storage[argv_len] = a;
+        argv_len += 1;
+    }
+    const argv: [][:0]const u8 = argv_storage[0..argv_len];
     if (argv.len < 3) {
         print_usage();
         return 1;
     }
 
-    const command = std.mem.span(argv[1]);
-    const model_directory = std.mem.span(argv[2]);
+    const command = argv[1];
+    const model_directory = argv[2];
 
     var tokens_csv: []const u8 = "1,2,3";
     var tokens_file: []const u8 = "";
@@ -31,6 +45,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var host: []const u8 = "0.0.0.0";
     var model_name: []const u8 = "inkling-2-mini";
     var model_name_explicit: bool = false;
+    var gguf_path: []const u8 = "";
+    var draft_gguf_path: []const u8 = "";
+    var meta_dir: []const u8 = "";
     var ablation_path: []const u8 = "";
     var out_path: []const u8 = "";
     var ref_path: []const u8 = "";
@@ -60,90 +77,99 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     var arg_i: usize = 3;
     while (arg_i < argv.len) : (arg_i += 1) {
-        const arg = std.mem.span(argv[arg_i]);
+        const arg = argv[arg_i];
         if (std.mem.eql(u8, arg, "--tokens") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            tokens_csv = std.mem.span(argv[arg_i]);
+            tokens_csv = argv[arg_i];
             has_tokens_arg = true;
         } else if (std.mem.eql(u8, arg, "--tokens-file") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            tokens_file = std.mem.span(argv[arg_i]);
+            tokens_file = argv[arg_i];
             has_tokens_arg = true;
         } else if (std.mem.eql(u8, arg, "--prompt") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            prompt_text = std.mem.span(argv[arg_i]);
+            prompt_text = argv[arg_i];
         } else if (std.mem.eql(u8, arg, "--prompt-file") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            prompt_file = std.mem.span(argv[arg_i]);
+            prompt_file = argv[arg_i];
         } else if (std.mem.eql(u8, arg, "--mode") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            mode_str = std.mem.span(argv[arg_i]);
+            mode_str = argv[arg_i];
         } else if (std.mem.eql(u8, arg, "--kv") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            kv_str = std.mem.span(argv[arg_i]);
+            kv_str = argv[arg_i];
         } else if (std.mem.eql(u8, arg, "--host") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            host = std.mem.span(argv[arg_i]);
+            host = argv[arg_i];
         } else if (std.mem.eql(u8, arg, "--port") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            port = std.fmt.parseInt(u16, std.mem.span(argv[arg_i]), 10) catch 8000;
+            port = std.fmt.parseInt(u16, argv[arg_i], 10) catch 8000;
         } else if (std.mem.eql(u8, arg, "--model-name") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            model_name = std.mem.span(argv[arg_i]);
+            model_name = argv[arg_i];
             model_name_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--gguf") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            gguf_path = argv[arg_i];
+        } else if (std.mem.eql(u8, arg, "--draft-gguf") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            draft_gguf_path = argv[arg_i];
+        } else if (std.mem.eql(u8, arg, "--meta-dir") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            meta_dir = argv[arg_i];
         } else if (std.mem.eql(u8, arg, "--ablation") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            ablation_path = std.mem.span(argv[arg_i]);
+            ablation_path = argv[arg_i];
         } else if (std.mem.eql(u8, arg, "--out") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            out_path = std.mem.span(argv[arg_i]);
+            out_path = argv[arg_i];
         } else if (std.mem.eql(u8, arg, "--ref") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            ref_path = std.mem.span(argv[arg_i]);
+            ref_path = argv[arg_i];
         } else if (std.mem.eql(u8, arg, "--effort") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            effort = std.mem.span(argv[arg_i]);
+            effort = argv[arg_i];
         } else if (std.mem.eql(u8, arg, "--api-key") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            api_key = std.mem.span(argv[arg_i]);
+            api_key = argv[arg_i];
         } else if (std.mem.eql(u8, arg, "--mtp") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            mtp = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 0;
+            mtp = std.fmt.parseInt(u32, argv[arg_i], 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--spec-threshold") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            const v = std.fmt.parseFloat(f32, std.mem.span(argv[arg_i])) catch 0.80;
+            const v = std.fmt.parseFloat(f32, argv[arg_i]) catch 0.80;
             spec_threshold = if (std.math.isFinite(v)) v else 0.80;
         } else if (std.mem.eql(u8, arg, "--temp") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            const v = std.fmt.parseFloat(f32, std.mem.span(argv[arg_i])) catch 0.0;
+            const v = std.fmt.parseFloat(f32, argv[arg_i]) catch 0.0;
             temperature = if (std.math.isFinite(v) and v >= 0.0) v else 0.0;
         } else if (std.mem.eql(u8, arg, "--top-p") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            const v = std.fmt.parseFloat(f32, std.mem.span(argv[arg_i])) catch 0.95;
+            const v = std.fmt.parseFloat(f32, argv[arg_i]) catch 0.95;
             top_p = if (std.math.isFinite(v) and v > 0.0 and v <= 1.0) v else 0.95;
         } else if (std.mem.eql(u8, arg, "--top-k") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            top_k = std.fmt.parseInt(i32, std.mem.span(argv[arg_i]), 10) catch 0;
+            top_k = std.fmt.parseInt(i32, argv[arg_i], 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--seed") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            seed = std.fmt.parseInt(u64, std.mem.span(argv[arg_i]), 10) catch 0;
+            seed = std.fmt.parseInt(u64, argv[arg_i], 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--loopcd-omega") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            const v = std.fmt.parseFloat(f32, std.mem.span(argv[arg_i])) catch 0.0;
+            const v = std.fmt.parseFloat(f32, argv[arg_i]) catch 0.0;
             loopcd_omega = if (std.math.isFinite(v) and v >= -1.0 and v <= 2.0) v else 0.0;
         } else if (std.mem.eql(u8, arg, "--loopcd-ref") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            const v = std.fmt.parseInt(i32, std.mem.span(argv[arg_i]), 10) catch 1;
+            const v = std.fmt.parseInt(i32, argv[arg_i], 10) catch 1;
             loopcd_ref = if (v == 2) 2 else 1;
         } else if (std.mem.eql(u8, arg, "--max-tokens") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            max_tokens = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 128;
+            max_tokens = std.fmt.parseInt(u32, argv[arg_i], 10) catch 128;
         } else if (std.mem.eql(u8, arg, "--runs") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            runs = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 6;
+            runs = std.fmt.parseInt(u32, argv[arg_i], 10) catch 6;
         } else if (std.mem.eql(u8, arg, "--ctx") and arg_i + 1 < argv.len) {
             arg_i += 1;
-            ctx = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 8192;
+            ctx = std.fmt.parseInt(u32, argv[arg_i], 10) catch 8192;
         } else if (std.mem.eql(u8, arg, "--embed-host")) {
             embed_on_host = true;
         } else if (std.mem.eql(u8, arg, "--no-graph")) {
@@ -159,6 +185,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
 
+    if (gguf_path.len == 0 and std.mem.endsWith(u8, model_directory, ".gguf")) {
+        gguf_path = model_directory;
+    }
+    const effective_meta_dir: []const u8 = if (meta_dir.len > 0)
+        meta_dir
+    else if (std.mem.endsWith(u8, model_directory, ".gguf"))
+        (std.fs.path.dirname(model_directory) orelse ".")
+    else
+        model_directory;
+
     const prompt_file_buf: ?[]u8 = if (prompt_file.len > 0) tiger.alloc_host_zeroed(u8, 32 * 1024 * 1024) else null;
     defer if (prompt_file_buf) |b| tiger.free_host_slice(u8, b);
     if (prompt_file_buf) |b| {
@@ -171,7 +207,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Fast tokenizer-only diagnostic & benchmark command (no GPU required)
     if (std.mem.eql(u8, command, "tokenize")) {
         var tok: tokenizer_mod.Tokenizer = .{};
-        if (!tok.load(model_directory)) return 1;
+        if (!tok.load(effective_meta_dir)) return 1;
         defer tok.deinit();
 
         var scratch = tokenizer_mod.TokenizerScratch.init();
@@ -199,7 +235,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const need_tokenizer: bool = std.mem.eql(u8, command, "serve") or prompt_text.len > 0;
     var tokenizer: tokenizer_mod.Tokenizer = .{};
     if (need_tokenizer) {
-        if (!tokenizer.load(model_directory)) return 1;
+        if (!tokenizer.load(effective_meta_dir)) return 1;
     }
     defer if (need_tokenizer) tokenizer.deinit();
 
@@ -271,7 +307,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     var model_weights: weights_mod.ModelWeights = .{};
     const load_mtp: bool = (mtp > 0 or std.mem.eql(u8, command, "bench") or std.mem.eql(u8, command, "longctx") or std.mem.eql(u8, command, "serve"));
-    if (!model_weights.load(model_directory, quant_mode, load_mtp, embed_on_host, ablation_path)) return 1;
+    const weights_ok: bool = if (gguf_path.len > 0)
+        model_weights.load_gguf(gguf_path, draft_gguf_path, effective_meta_dir, quant_mode, load_mtp, embed_on_host, ablation_path)
+    else
+        model_weights.load(model_directory, quant_mode, load_mtp, embed_on_host, ablation_path);
+    if (!weights_ok) return 1;
     defer model_weights.deinit();
 
     var engine: engine_mod.Engine = .{};
@@ -324,7 +364,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
         @memcpy(pz[0..out_path.len], out_path);
         pz[out_path.len] = 0;
-        const fd = tiger.open(@ptrCast(&pz), tiger.O_WRONLY | tiger.O_CREAT | tiger.O_TRUNC, @as(c_uint, 0o644));
+        const fd = tiger.open_create(@ptrCast(&pz), tiger.O_WRONLY | tiger.O_CREAT | tiger.O_TRUNC, 0o644);
         if (fd < 0) {
             tiger.print_stderr("Failed to open --out '{s}' for writing\n", .{out_path});
             return 1;

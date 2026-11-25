@@ -101,7 +101,7 @@ struct LoopCDConfig {
     int32_t ref_pass; // 1 = h_1 (after pass 0, vi=17), 2 = h_2 (after pass 1, vi=29)
 };
 
-constexpr int KV_SPLIT_K = 64;    // 8 KV heads x 64 bulk splits = 512 CTAs (3.0 blocks/SM!)
+constexpr int KV_SPLIT_K = 32;    // 8 KV heads x 64 bulk splits = 512 CTAs (3.0 blocks/SM!)
 constexpr int KV_LOCAL_SPLITS = 17; // 17 x 64 = 1088 >= 1024+8 (1 single tile per CTA!)
 constexpr int KV_TOTAL_SPLITS = KV_SPLIT_K + KV_LOCAL_SPLITS; // 81 slots in split_buf
 constexpr int KV_Q4_GROUP = 64;  // 2 groups per 128-dim head

@@ -1461,6 +1461,10 @@ void launch_prefill_moe_gate_up_h(
     const ExpertBank& w13, const __half* x_h,
     const int32_t* expert_offsets, const int32_t* sorted_tok, const int32_t* sorted_slot,
     __half* out_act_h, int B, cudaStream_t stream) {
+    if (w13.gguf_type != 0) {
+        launch_prefill_moe_gate_up_gguf_h(w13.gguf_type, w13.data, w13.expert_scale, x_h, expert_offsets, sorted_tok, sorted_slot, out_act_h, B, stream);
+        return;
+    }
     if (w13.is_nvfp4) {
         if (B <= 512) dispatch_wgemm_tm<0, WgemmMode::Up, HIDDEN, 32>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, stream);
         else          dispatch_wgemm_tm<0, WgemmMode::Up, HIDDEN, 128>(w13, x_h, expert_offsets, sorted_tok, sorted_slot, nullptr, out_act_h, nullptr, stream);
@@ -1474,6 +1478,10 @@ void launch_prefill_moe_down_h(
     const ExpertBank& w2, const __half* act_h,
     const int32_t* expert_offsets, const int32_t* sorted_tok, const int32_t* sorted_slot,
     const float* sorted_w, float* out_slots, int B, cudaStream_t stream) {
+    if (w2.gguf_type != 0) {
+        launch_prefill_moe_down_gguf_h(w2.gguf_type, w2.data, w2.expert_scale, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, out_slots, B, stream);
+        return;
+    }
     if (w2.is_nvfp4) {
         if (B <= 512) dispatch_wgemm_tm<0, WgemmMode::Down, INTERMEDIATE, 32>(w2, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, nullptr, out_slots, stream);
         else          dispatch_wgemm_tm<0, WgemmMode::Down, INTERMEDIATE, 128>(w2, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, nullptr, out_slots, stream);

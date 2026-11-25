@@ -19,17 +19,19 @@ pub fn build(b: *std.Build) void {
         []const u8,
         "cuda-arch",
         "CUDA Blackwell SM architecture (default: 120a)",
-    ) orelse "120a";
+    ) orelse "89";
 
     const cuda_path = b.option(
         []const u8,
         "cuda-path",
         "CUDA toolkit root directory (default: /usr/local/cuda)",
-    ) orelse "/usr/local/cuda";
+    ) orelse "/usr/local/cuda-12.5";
 
-    const nvcc_bin = b.fmt("{s}/bin/nvcc", .{cuda_path});
-    const cuda_lib = b.fmt("{s}/lib64", .{cuda_path});
-    const gencode = b.fmt("arch=compute_{s},code=sm_{s}", .{ cuda_arch, cuda_arch });
+    const cuda_import_lib = b.option(
+        []const u8,
+        "cuda-import-lib",
+        "Prebuilt CUDA DLL import library path (Windows target, e.g. build-win/libsquid4070_cuda.dll.a)",
+    );
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -38,54 +40,67 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    // Compile all 5 Blackwell CUDA translation units in parallel with full
-    // content-addressed Zig caching (including header dependency tracking).
-    const cuda_headers = [_][]const u8{
-        "cuda/config.hpp",
-        "cuda/weights.hpp",
-        "cuda/kernels.hpp",
-        "cuda/kernels_common.cuh",
-    };
+    if (target.result.os.tag == .windows) {
+        const import_lib = cuda_import_lib orelse @panic("Windows builds require -Dcuda-import-lib=<path>");
+        root_module.addObjectFile(.{ .cwd_relative = import_lib });
+        root_module.linkSystemLibrary("ws2_32", .{});
+        root_module.linkSystemLibrary("kernel32", .{});
+    } else {
+        const nvcc_bin = b.fmt("{s}/bin/nvcc", .{cuda_path});
+        const cuda_lib = b.fmt("{s}/lib64", .{cuda_path});
+        const gencode = b.fmt("arch=compute_{s},code=sm_{s}", .{ cuda_arch, cuda_arch });
 
-    const cuda_sources = [_]struct { src: []const u8, obj: []const u8 }{
-        .{ .src = "cuda/kernels_gemv.cu", .obj = "kernels_gemv.o" },
-        .{ .src = "cuda/kernels_inkling.cu", .obj = "kernels_inkling.o" },
-        .{ .src = "cuda/kernels_dspark.cu", .obj = "kernels_dspark.o" },
-        .{ .src = "cuda/kernels_prefill.cu", .obj = "kernels_prefill.o" },
-        .{ .src = "cuda/cuda_abi.cu", .obj = "cuda_abi.o" },
-    };
+        // Compile all 6 CUDA translation units in parallel with full
+        // content-addressed Zig caching (including header dependency tracking).
+        const cuda_headers = [_][]const u8{
+            "cuda/config.hpp",
+            "cuda/weights.hpp",
+            "cuda/kernels.hpp",
+            "cuda/kernels_common.cuh",
+            "cuda/gguf_quants.cuh",
+        };
 
-    for (cuda_sources) |cu| {
-        const nvcc = b.addSystemCommand(&.{
-            nvcc_bin,
-            "-O3",
-            "--use_fast_math",
-            "-std=c++20",
-            "-gencode",
-            gencode,
-            "--expt-relaxed-constexpr",
-            "-I",
-        });
-        nvcc.addDirectoryArg(b.path("cuda"));
-        nvcc.addArg("-c");
-        nvcc.addFileArg(b.path(cu.src));
-        nvcc.addArg("-o");
-        const obj_file = nvcc.addOutputFileArg(cu.obj);
-        for (cuda_headers) |hdr| {
-            nvcc.addFileInput(b.path(hdr));
+        const cuda_sources = [_]struct { src: []const u8, obj: []const u8 }{
+            .{ .src = "cuda/kernels_gemv.cu", .obj = "kernels_gemv.o" },
+            .{ .src = "cuda/kernels_inkling.cu", .obj = "kernels_inkling.o" },
+            .{ .src = "cuda/kernels_dspark.cu", .obj = "kernels_dspark.o" },
+            .{ .src = "cuda/kernels_prefill.cu", .obj = "kernels_prefill.o" },
+            .{ .src = "cuda/cuda_abi.cu", .obj = "cuda_abi.o" },
+            .{ .src = "cuda/kernels_gguf_moe.cu", .obj = "kernels_gguf_moe.o" },
+        };
+
+        for (cuda_sources) |cu| {
+            const nvcc = b.addSystemCommand(&.{
+                nvcc_bin,
+                "-O3",
+                "--use_fast_math",
+                "-std=c++20",
+                "-gencode",
+                gencode,
+                "--expt-relaxed-constexpr",
+                "-I",
+            });
+            nvcc.addDirectoryArg(b.path("cuda"));
+            nvcc.addArg("-c");
+            nvcc.addFileArg(b.path(cu.src));
+            nvcc.addArg("-o");
+            const obj_file = nvcc.addOutputFileArg(cu.obj);
+            for (cuda_headers) |hdr| {
+                nvcc.addFileInput(b.path(hdr));
+            }
+            root_module.addObjectFile(obj_file);
         }
-        root_module.addObjectFile(obj_file);
+
+        root_module.addLibraryPath(.{ .cwd_relative = cuda_lib });
+        root_module.linkSystemLibrary("cudart", .{});
+        root_module.linkSystemLibrary("cublas", .{});
+        root_module.linkSystemLibrary("stdc++", .{});
+        root_module.linkSystemLibrary("m", .{});
+        root_module.linkSystemLibrary("pthread", .{});
     }
 
-    root_module.addLibraryPath(.{ .cwd_relative = cuda_lib });
-    root_module.linkSystemLibrary("cudart", .{});
-    root_module.linkSystemLibrary("cublas", .{});
-    root_module.linkSystemLibrary("stdc++", .{});
-    root_module.linkSystemLibrary("m", .{});
-    root_module.linkSystemLibrary("pthread", .{});
-
     const exe = b.addExecutable(.{
-        .name = "squid5090",
+        .name = "squid4070",
         .root_module = root_module,
     });
     b.installArtifact(exe);

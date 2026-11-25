@@ -93,6 +93,27 @@ void launch_qkvrg_fused(
 void launch_f32_to_f16(const float* src, __half* dst, int n, cudaStream_t stream);
 
 // MoE Gate+Up + Softcapped SwiGLU (reads half x, writes half out_act!)
+void launch_moe_gate_up_gguf_h(
+    uint8_t gguf_type, const uint8_t* w13_data, const float* expert_scale,
+    const __half* x_h, const int32_t* route_ids, __half* out_act_h,
+    int B, cudaStream_t stream);
+
+void launch_moe_down_gguf_h(
+    uint8_t gguf_type, const uint8_t* w2_data, const float* expert_scale,
+    const __half* act_h, const int32_t* route_ids, const float* route_w,
+    float* out_down, int B, cudaStream_t stream);
+
+void launch_prefill_moe_gate_up_gguf_h(
+    uint8_t gguf_type, const uint8_t* w13_data, const float* expert_scale,
+    const __half* x_h, const int32_t* expert_offsets, const int32_t* sorted_tok,
+    const int32_t* sorted_slot, __half* out_act_h, int B, cudaStream_t stream);
+
+void launch_prefill_moe_down_gguf_h(
+    uint8_t gguf_type, const uint8_t* w2_data, const float* expert_scale,
+    const __half* act_h, const int32_t* expert_offsets, const int32_t* sorted_tok,
+    const int32_t* sorted_slot, const float* sorted_w, float* out_slots,
+    int B, cudaStream_t stream);
+
 void launch_moe_gate_up_h(
     const ExpertBank& w13,
     const __half* x_h,         // [B, HIDDEN]

@@ -24,3 +24,13 @@ work/
 .vscode/
 .idea/
 *.swp
+# Windows / native DLL build & compiled CUDA test binaries
+build-win/
+.backup-pre-win/
+*.exe
+*.dll
+*.lib
+*.exp
+*.obj
+tests/test_gguf_moe
+tests/test_gguf_quants

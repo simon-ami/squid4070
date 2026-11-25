@@ -448,7 +448,7 @@ markov_rnn_proj_kernel(
 }
 
 // Persistent 680-block SMEM NVFP4 base_logits[K, Vd] = unembed_draft @ normed_h + fold_b (HALF-WARP -> 0% idle!)
-constexpr int DSPARK_UNEMBED_BLOCKS = 680;
+constexpr int DSPARK_UNEMBED_BLOCKS = 396;
 
 template <int K_CONST>
 __global__ void __launch_bounds__(256)
@@ -638,7 +638,7 @@ dspark_base_logits_nvfp4_mma_kernel(
     }
 }
 
-constexpr int MARKOV_BLOCKS = 340; // 2 blocks/SM (16 rows/block = 5440 concurrent rows -> 0% tail!)
+constexpr int MARKOV_BLOCKS = 264; // 2 blocks/SM (16 rows/block = 5440 concurrent rows -> 0% tail!)
 
 template <int KIND> // 0=BF16, 2=NVFP4
 __global__ void __launch_bounds__(256)

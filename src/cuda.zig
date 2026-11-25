@@ -28,6 +28,7 @@ pub const CLinearWeight = extern struct {
 
 pub const CExpertBank = extern struct {
     is_nvfp4: u8 = 0,
+    gguf_type: u8 = 0,
     n_experts: i32 = 0,
     rows: i32 = 0,
     cols: i32 = 0,
@@ -145,6 +146,43 @@ pub extern "c" fn squid_split_dspark_rnn(
     w_sp: *anyopaque,
     w_h: *anyopaque,
     w_f: *anyopaque,
+) void;
+
+pub extern "c" fn squid_dequant_gguf_to_bf16(
+    gguf_type: u32,
+    src_dev: [*]const u8,
+    dst_bf16_dev: *anyopaque,
+    n_rows: i64,
+    cols: i64,
+) void;
+
+pub extern "c" fn squid_dequant_gguf_to_f32(
+    gguf_type: u32,
+    src_dev: [*]const u8,
+    dst_f32_dev: [*]f32,
+    n_rows: i64,
+    cols: i64,
+) void;
+
+pub extern "c" fn squid_transpose_f32_to_bf16(
+    src_f32_dev: [*]const f32,
+    dst_bf16_dev: *anyopaque,
+    src_rows: i32,
+    src_cols: i32,
+) void;
+
+pub extern "c" fn squid_global_sconv_f32_to_bf16(
+    src_f32_dev: [*]const f32,
+    dst_bf16_dev: *anyopaque,
+    channels: i32,
+) void;
+
+pub extern "c" fn squid_gather_bf16_rows(
+    src_bf16_dev: *const anyopaque,
+    ids: [*]const i32,
+    dst_bf16_dev: *anyopaque,
+    count: i32,
+    cols: i32,
 ) void;
 
 pub extern "c" fn squid_compute_dspark_fold(

@@ -41,6 +41,7 @@ __device__ __forceinline__ void pdl_trigger() {
 
 template <class... KArgs, class... Args>
 inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, int block, cudaStream_t stream, Args&&... args) {
+#if defined(SQUID_ENABLE_PDL)
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = grid;
     cfg.blockDim = dim3(block);
@@ -51,6 +52,10 @@ inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, int block, cudaStrea
     cfg.attrs = attr;
     cfg.numAttrs = 1;
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...));
+#else
+    kernel<<<grid, dim3(block), 0, stream>>>(static_cast<KArgs>(args)...);
+    CUDA_CHECK(cudaGetLastError());
+#endif
 }
 
 __device__ __forceinline__ uint4 ld_stream_u4(const void* p) {
@@ -118,6 +123,13 @@ __device__ __forceinline__ void mma_m16n8k16_f32_bf16(
 
 // Hardware Blackwell sm_120 PTX FP4 (e2m1x2) -> half2 conversion!
 // Single-instruction hardware decode on Blackwell (zero LUT / bitshift overhead).
+__device__ __forceinline__ uint32_t e2m1_nib_to_fp16_bits(uint32_t x) {
+    uint32_t sign = (x & 8u) << 12;
+    uint32_t mag = x & 7u;
+    uint32_t bits = (mag == 0u) ? 0u : ((mag == 1u) ? 0x3800u : (0x3800u + (mag << 9)));
+    return bits | sign;
+}
+
 __device__ __forceinline__ __half2 cvt_e2m1x2_to_half2(uint32_t byte_val) {
     uint32_t out;
 #if __CUDA_ARCH__ >= 1000
@@ -127,12 +139,7 @@ __device__ __forceinline__ __half2 cvt_e2m1x2_to_half2(uint32_t byte_val) {
         "  cvt.rn.f16x2.e2m1x2 %0, b0; }\n"
         : "=r"(out) : "h"(tmp));
 #else
-    static constexpr float lut[16] = {
-        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-    };
-    __half2 h = __floats2half2_rn(lut[byte_val & 0xFu], lut[(byte_val >> 4) & 0xFu]);
-    out = *reinterpret_cast<uint32_t*>(&h);
+    out = e2m1_nib_to_fp16_bits(byte_val & 0xFu) | (e2m1_nib_to_fp16_bits((byte_val >> 4) & 0xFu) << 16);
 #endif
     return *reinterpret_cast<__half2*>(&out);
 }

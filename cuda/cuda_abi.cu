@@ -6,6 +6,7 @@
 #include "kernels.hpp"
 #include "kernels_common.cuh"
 #include "weights.hpp"
+#include "gguf_quants.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -194,6 +195,102 @@ __global__ void z_compute_dspark_fold_w_kernel(
     fold_out[(size_t)v * R + r] = __float2bfloat16(acc);
 }
 
+template <class Block, bool ToBF16>
+__global__ void z_dequant_gguf_kernel(
+    const uint8_t* __restrict__ src, void* __restrict__ dst, size_t n_elems, size_t cols) {
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_elems) return;
+    constexpr int V = squid::gguf::quant_traits<Block>::values;
+    const size_t row = idx / cols;
+    const size_t col = idx % cols;
+    const size_t blks_per_row = cols / (size_t)V;
+    const size_t blk = col / (size_t)V;
+    const int lane = static_cast<int>(col % (size_t)V);
+    const uint8_t* blk_ptr = src + (row * blks_per_row + blk) * sizeof(Block);
+    float value;
+    if constexpr (std::is_same_v<Block, squid::gguf::block_iq4_nl>) {
+        // Load just the scale and active byte from a possibly unaligned buffer.
+        const uint16_t d = uint16_t(blk_ptr[0]) | (uint16_t(blk_ptr[1]) << 8);
+        value = squid::gguf::detail::dequant_iq4_nl(d, blk_ptr[2 + lane % 16], lane / 16);
+    } else {
+        Block b;
+        memcpy(&b, blk_ptr, sizeof(Block));
+        if constexpr (ToBF16 && std::is_same_v<Block, squid::gguf::block_bf16>) {
+            memcpy(&static_cast<__nv_bfloat16*>(dst)[idx], &b.bits, sizeof(uint16_t));
+            return;
+        }
+        value = squid::gguf::dequant_value(b, lane);
+    }
+    if constexpr (ToBF16) {
+        static_cast<__nv_bfloat16*>(dst)[idx] = __float2bfloat16_rn(value);
+    } else {
+        static_cast<float*>(dst)[idx] = value;
+    }
+}
+
+template <bool ToBF16>
+static void dispatch_dequant_gguf(
+    uint32_t gguf_type, const uint8_t* src_dev, void* dst_dev, int64_t n_rows, int64_t cols) {
+    const size_t n_elems = static_cast<size_t>(n_rows) * static_cast<size_t>(cols);
+    if (n_elems == 0) return;
+    const int grid = static_cast<int>((n_elems + 255) / 256);
+    const auto t = static_cast<squid::gguf::Type>(gguf_type);
+    switch (t) {
+        case squid::gguf::Type::f32:     z_dequant_gguf_kernel<squid::gguf::block_f32,     ToBF16><<<grid, 256>>>(src_dev, dst_dev, n_elems, cols); break;
+        case squid::gguf::Type::q8_0:    z_dequant_gguf_kernel<squid::gguf::block_q8_0,    ToBF16><<<grid, 256>>>(src_dev, dst_dev, n_elems, cols); break;
+        case squid::gguf::Type::q4_k:    z_dequant_gguf_kernel<squid::gguf::block_q4_k,    ToBF16><<<grid, 256>>>(src_dev, dst_dev, n_elems, cols); break;
+        case squid::gguf::Type::q5_k:    z_dequant_gguf_kernel<squid::gguf::block_q5_k,    ToBF16><<<grid, 256>>>(src_dev, dst_dev, n_elems, cols); break;
+        case squid::gguf::Type::q6_k:    z_dequant_gguf_kernel<squid::gguf::block_q6_k,    ToBF16><<<grid, 256>>>(src_dev, dst_dev, n_elems, cols); break;
+        case squid::gguf::Type::iq2_xxs: z_dequant_gguf_kernel<squid::gguf::block_iq2_xxs, ToBF16><<<grid, 256>>>(src_dev, dst_dev, n_elems, cols); break;
+        case squid::gguf::Type::iq2_xs:  z_dequant_gguf_kernel<squid::gguf::block_iq2_xs,  ToBF16><<<grid, 256>>>(src_dev, dst_dev, n_elems, cols); break;
+        case squid::gguf::Type::iq3_xxs: z_dequant_gguf_kernel<squid::gguf::block_iq3_xxs, ToBF16><<<grid, 256>>>(src_dev, dst_dev, n_elems, cols); break;
+        case squid::gguf::Type::iq1_s:   z_dequant_gguf_kernel<squid::gguf::block_iq1_s,   ToBF16><<<grid, 256>>>(src_dev, dst_dev, n_elems, cols); break;
+        case squid::gguf::Type::iq4_nl:  z_dequant_gguf_kernel<squid::gguf::block_iq4_nl,  ToBF16><<<grid, 256>>>(src_dev, dst_dev, n_elems, cols); break;
+        case squid::gguf::Type::iq2_s:   z_dequant_gguf_kernel<squid::gguf::block_iq2_s,   ToBF16><<<grid, 256>>>(src_dev, dst_dev, n_elems, cols); break;
+        case squid::gguf::Type::iq4_xs:  z_dequant_gguf_kernel<squid::gguf::block_iq4_xs,  ToBF16><<<grid, 256>>>(src_dev, dst_dev, n_elems, cols); break;
+        case squid::gguf::Type::bf16:    z_dequant_gguf_kernel<squid::gguf::block_bf16,    ToBF16><<<grid, 256>>>(src_dev, dst_dev, n_elems, cols); break;
+        case squid::gguf::Type::nvfp4:   z_dequant_gguf_kernel<squid::gguf::block_nvfp4,   ToBF16><<<grid, 256>>>(src_dev, dst_dev, n_elems, cols); break;
+        case squid::gguf::Type::q2_0:    z_dequant_gguf_kernel<squid::gguf::block_q2_0,    ToBF16><<<grid, 256>>>(src_dev, dst_dev, n_elems, cols); break;
+        default:
+            fprintf(stderr, "Unsupported ggml_type %u in z_dequant_gguf_kernel\n", gguf_type);
+            std::abort();
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void z_transpose_f32_to_bf16_kernel(
+    const float* __restrict__ src, __nv_bfloat16* __restrict__ dst, int32_t src_rows, int32_t src_cols) {
+    const size_t n = static_cast<size_t>(src_rows) * static_cast<size_t>(src_cols);
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const int32_t r = static_cast<int32_t>(idx / static_cast<size_t>(src_cols));
+    const int32_t c = static_cast<int32_t>(idx % static_cast<size_t>(src_cols));
+    dst[static_cast<size_t>(c) * static_cast<size_t>(src_rows) + static_cast<size_t>(r)] =
+        __float2bfloat16_rn(src[idx]);
+}
+
+__global__ void z_global_sconv_f32_to_bf16_kernel(
+    const float* __restrict__ src, __nv_bfloat16* __restrict__ dst, int32_t channels) {
+    const size_t n = static_cast<size_t>(channels) * 4;
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const int32_t lag = static_cast<int32_t>(idx / static_cast<size_t>(channels));
+    const int32_t c = static_cast<int32_t>(idx % static_cast<size_t>(channels));
+    dst[idx] = __float2bfloat16_rn(src[static_cast<size_t>(c) * 4 + (3 - lag)]);
+}
+
+__global__ void z_gather_bf16_rows_kernel(
+    const __nv_bfloat16* __restrict__ src, const int32_t* __restrict__ ids,
+    __nv_bfloat16* __restrict__ dst, int32_t count, int32_t cols) {
+    const size_t n = static_cast<size_t>(count) * static_cast<size_t>(cols);
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const int32_t row = static_cast<int32_t>(idx / static_cast<size_t>(cols));
+    const int32_t col = static_cast<int32_t>(idx % static_cast<size_t>(cols));
+    const int32_t src_row = ids[row];
+    dst[idx] = src[static_cast<size_t>(src_row) * static_cast<size_t>(cols) + static_cast<size_t>(col)];
+}
+
 __global__ void z_split_dspark_rnn_kernel(
     const __nv_bfloat16* __restrict__ src,
     __nv_bfloat16* __restrict__ w_sp, __nv_bfloat16* __restrict__ w_h, __nv_bfloat16* __restrict__ w_f) {
@@ -223,6 +320,7 @@ __global__ void z_assemble_verify_tokens_kernel(
     else if (i <= num_drafts) d_tokens[i] = d_drafts[i - 1];
 }
 
+#if CUDART_VERSION >= 13000
 __global__ void z_adaptive_select_width_kernel(
     const int32_t* __restrict__ d_anchor,
     const int32_t* __restrict__ d_drafts,
@@ -250,6 +348,39 @@ struct CAdaptiveGraph {
     cudaGraphConditionalHandle handle{};
     cudaGraph_t bodies[3] = {nullptr, nullptr, nullptr};
 };
+#else
+__global__ void z_adaptive_select_width_if3_kernel(
+    const int32_t* __restrict__ d_anchor,
+    const int32_t* __restrict__ d_drafts,
+    const float* __restrict__ d_draft_conf,
+    float threshold,
+    int32_t* __restrict__ d_tokens,
+    int32_t* __restrict__ d_chosen_width,
+    cudaGraphConditionalHandle h0,
+    cudaGraphConditionalHandle h1,
+    cudaGraphConditionalHandle h2) {
+    if (threadIdx.x != 0) return;
+    int n_conf = 0;
+    while (n_conf < MTP_MAX_DRAFTS && d_draft_conf[n_conf] >= threshold) {
+        ++n_conf;
+    }
+    unsigned int case_idx = (n_conf <= 1) ? 0u : ((n_conf <= 3) ? 1u : 2u);
+    int width = (case_idx == 0u) ? 2 : ((case_idx == 1u) ? 4 : 8);
+    d_tokens[0] = *d_anchor;
+    for (int i = 0; i < width - 1; ++i) d_tokens[1 + i] = d_drafts[i];
+    *d_chosen_width = width;
+    cudaGraphSetConditional(h0, case_idx == 0u ? 1u : 0u);
+    cudaGraphSetConditional(h1, case_idx == 1u ? 1u : 0u);
+    cudaGraphSetConditional(h2, case_idx == 2u ? 1u : 0u);
+}
+
+struct CAdaptiveGraph {
+    cudaGraph_t root_graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    cudaGraphConditionalHandle handles[3]{};
+    cudaGraph_t bodies[3] = {nullptr, nullptr, nullptr};
+};
+#endif
 
 } // namespace
 
@@ -268,6 +399,7 @@ struct CLinearWeight {
 
 struct CExpertBank {
     uint8_t is_nvfp4;
+    uint8_t gguf_type;
     int32_t n_experts;
     int32_t rows;
     int32_t cols;
@@ -337,6 +469,7 @@ static LinearWeight to_lw(const CLinearWeight& c) {
 static ExpertBank to_eb(const CExpertBank& c) {
     ExpertBank eb;
     eb.is_nvfp4 = (c.is_nvfp4 != 0);
+    eb.gguf_type = c.gguf_type;
     eb.n_experts = c.n_experts;
     eb.rows = c.rows;
     eb.cols = c.cols;
@@ -507,6 +640,41 @@ void squid_split_dspark_rnn(const void* src_bf16, void* w_sp, void* w_h, void* w
     z_split_dspark_rnn_kernel<<<768, 256>>>(
         static_cast<const __nv_bfloat16*>(src_bf16),
         static_cast<__nv_bfloat16*>(w_sp), static_cast<__nv_bfloat16*>(w_h), static_cast<__nv_bfloat16*>(w_f));
+}
+
+void squid_dequant_gguf_to_bf16(
+    uint32_t gguf_type, const uint8_t* src_dev, void* dst_bf16_dev, int64_t n_rows, int64_t cols) {
+    dispatch_dequant_gguf<true>(gguf_type, src_dev, dst_bf16_dev, n_rows, cols);
+}
+
+void squid_dequant_gguf_to_f32(
+    uint32_t gguf_type, const uint8_t* src_dev, float* dst_f32_dev, int64_t n_rows, int64_t cols) {
+    dispatch_dequant_gguf<false>(gguf_type, src_dev, dst_f32_dev, n_rows, cols);
+}
+
+void squid_transpose_f32_to_bf16(
+    const float* src_f32_dev, void* dst_bf16_dev, int32_t src_rows, int32_t src_cols) {
+    const size_t n = static_cast<size_t>(src_rows) * static_cast<size_t>(src_cols);
+    z_transpose_f32_to_bf16_kernel<<<(int)((n + 255) / 256), 256>>>(
+        src_f32_dev, static_cast<__nv_bfloat16*>(dst_bf16_dev), src_rows, src_cols);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void squid_global_sconv_f32_to_bf16(
+    const float* src_f32_dev, void* dst_bf16_dev, int32_t channels) {
+    const size_t n = static_cast<size_t>(channels) * 4;
+    z_global_sconv_f32_to_bf16_kernel<<<(int)((n + 255) / 256), 256>>>(
+        src_f32_dev, static_cast<__nv_bfloat16*>(dst_bf16_dev), channels);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void squid_gather_bf16_rows(
+    const void* src_bf16_dev, const int32_t* ids, void* dst_bf16_dev, int32_t count, int32_t cols) {
+    const size_t n = static_cast<size_t>(count) * static_cast<size_t>(cols);
+    z_gather_bf16_rows_kernel<<<(int)((n + 255) / 256), 256>>>(
+        static_cast<const __nv_bfloat16*>(src_bf16_dev), ids,
+        static_cast<__nv_bfloat16*>(dst_bf16_dev), count, cols);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void squid_compute_dspark_fold(
@@ -776,6 +944,7 @@ int32_t squid_adaptive_graph_create(
     CAdaptiveGraph* ag = new CAdaptiveGraph();
     cudaError_t err = cudaGraphCreate(&ag->root_graph, 0);
     if (err != cudaSuccess) { delete ag; return (int32_t)err; }
+#if CUDART_VERSION >= 13000
     err = cudaGraphConditionalHandleCreate(&ag->handle, ag->root_graph, 0, 0);
     if (err != cudaSuccess) { cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err; }
 
@@ -816,6 +985,48 @@ int32_t squid_adaptive_graph_create(
         cudaGraph_t disc = nullptr; cudaStreamEndCapture(s, &disc);
         cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err;
     }
+#else
+    for (int i = 0; i < 3; ++i) {
+        err = cudaGraphConditionalHandleCreate(&ag->handles[i], ag->root_graph, 0, 0);
+        if (err != cudaSuccess) { cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err; }
+    }
+
+    err = cudaStreamBeginCaptureToGraph(s, ag->root_graph, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal);
+    if (err != cudaSuccess) { cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err; }
+
+    z_adaptive_select_width_if3_kernel<<<1, 1, 0, s>>>(
+        d_anchor, d_drafts, d_draft_conf, threshold, d_tokens, d_chosen_width,
+        ag->handles[0], ag->handles[1], ag->handles[2]);
+
+    for (int i = 0; i < 3; ++i) {
+        cudaStreamCaptureStatus status;
+        cudaGraph_t g = nullptr;
+        const cudaGraphNode_t* deps = nullptr;
+        size_t ndeps = 0;
+        err = cudaStreamGetCaptureInfo(s, &status, nullptr, &g, &deps, &ndeps);
+        if (err != cudaSuccess) {
+            cudaGraph_t disc = nullptr; cudaStreamEndCapture(s, &disc);
+            cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err;
+        }
+        cudaGraphNodeParams p{};
+        p.type = cudaGraphNodeTypeConditional;
+        p.conditional.handle = ag->handles[i];
+        p.conditional.type = cudaGraphCondTypeIf;
+        p.conditional.size = 1;
+        cudaGraphNode_t if_node = nullptr;
+        err = cudaGraphAddNode(&if_node, g, deps, ndeps, &p);
+        if (err != cudaSuccess) {
+            cudaGraph_t disc = nullptr; cudaStreamEndCapture(s, &disc);
+            cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err;
+        }
+        ag->bodies[i] = p.conditional.phGraph_out[0];
+        err = cudaStreamUpdateCaptureDependencies(s, &if_node, 1, cudaStreamSetCaptureDependencies);
+        if (err != cudaSuccess) {
+            cudaGraph_t disc = nullptr; cudaStreamEndCapture(s, &disc);
+            cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err;
+        }
+    }
+#endif
 
     // Async D2H copy of verified outputs right after the switch node finishes!
     cudaMemcpyAsync(h_accepted, d_accepted, MTP_BLOCK_SIZE * sizeof(int32_t), cudaMemcpyDeviceToHost, s);

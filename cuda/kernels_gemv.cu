@@ -1262,7 +1262,7 @@ static void dispatch_linear_h_b(
 // Fused LM Head + Softcap(30) + GPU Argmax (HALF-WARP NVFP4 -> 0% tail waste!)
 // ============================================================================
 
-constexpr int LM_HEAD_BLOCKS = 680;
+constexpr int LM_HEAD_BLOCKS = 396;
 
 template <int B_CONST, int KIND>
 __global__ void __launch_bounds__(256)
@@ -2433,6 +2433,10 @@ void launch_build_expert_groups(
 void launch_moe_gate_up_h(
     const ExpertBank& w13, const __half* x_h, const int32_t* route_ids,
     const ExpertGroups* /*groups*/, __half* out_act_h, int B, cudaStream_t stream) {
+    if (w13.gguf_type != 0) {
+        launch_moe_gate_up_gguf_h(w13.gguf_type, w13.data, w13.expert_scale, x_h, route_ids, out_act_h, B, stream);
+        return;
+    }
     dim3 grid((2 * INTERMEDIATE) / MOE_TILE, B * TOP_K);
     if (w13.is_nvfp4) {
         launch_pdl(moe_up_tc_kernel<0>, grid, MOE_UP_WARPS * 32, stream,
@@ -2446,6 +2450,10 @@ void launch_moe_gate_up_h(
 void launch_moe_down_h(
     const ExpertBank& w2, const __half* act_h, const int32_t* route_ids, const float* route_w,
     const ExpertGroups* /*groups*/, float* out_down, int B, cudaStream_t stream, bool /*already_zeroed*/) {
+    if (w2.gguf_type != 0) {
+        launch_moe_down_gguf_h(w2.gguf_type, w2.data, w2.expert_scale, act_h, route_ids, route_w, out_down, B, stream);
+        return;
+    }
     dim3 grid(HIDDEN / MOE_TILE);
     if (w2.is_nvfp4) {
         launch_pdl(moe_down_tc_kernel<0>, grid, MOE_DOWN_WARPS * 32, stream,

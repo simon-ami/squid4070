@@ -22,12 +22,12 @@ const stop_sequence_max_bytes: usize = 64;
 const tool_calls_max: usize = 16;
 
 var g_stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-var g_listen_fd: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1);
+var g_listen_fd: std.atomic.Value(tiger.SocketFd) = std.atomic.Value(tiger.SocketFd).init(tiger.INVALID_SOCKET);
 
-fn handle_signal(_: i32) callconv(.c) void {
+fn handle_stop() void {
     g_stop_requested.store(true, .release);
-    const fd = g_listen_fd.swap(-1, .acq_rel);
-    if (fd >= 0) _ = tiger.close(fd);
+    const fd = g_listen_fd.swap(tiger.INVALID_SOCKET, .acq_rel);
+    if (tiger.is_valid_socket(fd)) tiger.net_close(fd);
 }
 
 pub const ServerConfig = struct {
@@ -312,18 +312,19 @@ pub fn run_openai_server(
     tiger.assert(config.port > 0);
     tiger.assert(config.context_tokens_max >= 64);
 
-    _ = tiger.signal(tiger.SIGPIPE, tiger.SIG_IGN);
-    _ = tiger.signal(tiger.SIGINT, handle_signal);
-    _ = tiger.signal(tiger.SIGTERM, handle_signal);
+    if (!tiger.net_init()) {
+        tiger.print_stderr("[server] Failed to initialize sockets\n", .{});
+        return 1;
+    }
+    tiger.install_stop_handlers(handle_stop);
 
-    const listen_fd: i32 = tiger.socket(tiger.AF_INET, tiger.SOCK_STREAM, 0);
-    if (listen_fd < 0) {
+    const listen_fd: tiger.SocketFd = tiger.net_socket_tcp();
+    if (!tiger.is_valid_socket(listen_fd)) {
         tiger.print_stderr("[server] Failed to create socket\n", .{});
         return 1;
     }
 
-    var reuse: i32 = 1;
-    _ = tiger.setsockopt(listen_fd, tiger.SOL_SOCKET, tiger.SO_REUSEADDR, @ptrCast(&reuse), @sizeOf(i32));
+    tiger.net_set_reuseaddr(listen_fd);
 
     var addr: tiger.SockaddrIn = .{
         .sin_family = tiger.AF_INET,
@@ -335,22 +336,22 @@ pub fn run_openai_server(
         tiger.assert(config.host.len < host_z_buf.len);
         @memcpy(host_z_buf[0..config.host.len], config.host);
         host_z_buf[config.host.len] = 0;
-        const rc = tiger.inet_pton(tiger.AF_INET, @ptrCast(&host_z_buf), &addr.sin_addr);
+        const rc = tiger.net_inet_pton_ipv4(@ptrCast(&host_z_buf), &addr.sin_addr);
         if (rc != 1) {
             tiger.print_stderr("[server] Invalid bind host '{s}'\n", .{config.host});
-            _ = tiger.close(listen_fd);
+            tiger.net_close(listen_fd);
             return 1;
         }
     }
 
-    if (tiger.bind(listen_fd, &addr, @sizeOf(tiger.SockaddrIn)) < 0) {
+    if (!tiger.net_bind_ipv4(listen_fd, &addr)) {
         tiger.print_stderr("[server] Failed to bind {s}:{d}\n", .{ config.host, config.port });
-        _ = tiger.close(listen_fd);
+        tiger.net_close(listen_fd);
         return 1;
     }
-    if (tiger.listen(listen_fd, 128) < 0) {
+    if (!tiger.net_listen(listen_fd, 128)) {
         tiger.print_stderr("[server] Failed to listen\n", .{});
-        _ = tiger.close(listen_fd);
+        tiger.net_close(listen_fd);
         return 1;
     }
 
@@ -367,25 +368,22 @@ pub fn run_openai_server(
         .{ config.host, config.port, config.model_name, config.context_tokens_max, config.default_mtp },
     );
 
-    const sock_timeout: tiger.Timeval = .{ .tv_sec = 30, .tv_usec = 0 };
     while (!g_stop_requested.load(.acquire)) {
-        const client_fd: i32 = tiger.accept(listen_fd, null, null);
-        if (client_fd < 0) {
+        const client_fd: tiger.SocketFd = tiger.net_accept(listen_fd);
+        if (!tiger.is_valid_socket(client_fd)) {
             if (g_stop_requested.load(.acquire)) break;
-            if (tiger.get_errno() == tiger.EINTR) continue;
+            if (tiger.net_last_error_is_eintr()) continue;
             continue;
         }
-        var nodelay: i32 = 1;
-        _ = tiger.setsockopt(client_fd, tiger.IPPROTO_TCP, tiger.TCP_NODELAY, @ptrCast(&nodelay), @sizeOf(i32));
-        _ = tiger.setsockopt(client_fd, tiger.SOL_SOCKET, tiger.SO_RCVTIMEO, @ptrCast(&sock_timeout), @sizeOf(tiger.Timeval));
-        _ = tiger.setsockopt(client_fd, tiger.SOL_SOCKET, tiger.SO_SNDTIMEO, @ptrCast(&sock_timeout), @sizeOf(tiger.Timeval));
+        tiger.net_set_nodelay(client_fd);
+        tiger.net_set_timeouts_ms(client_fd, 30_000);
 
         handle_connection(client_fd, engine, tokenizer, &config, &buffers, &prng_state);
-        _ = tiger.close(client_fd);
+        tiger.net_close(client_fd);
     }
 
-    const rem_fd = g_listen_fd.swap(-1, .acq_rel);
-    if (rem_fd >= 0) _ = tiger.close(rem_fd);
+    const rem_fd = g_listen_fd.swap(tiger.INVALID_SOCKET, .acq_rel);
+    if (tiger.is_valid_socket(rem_fd)) tiger.net_close(rem_fd);
     tiger.print_stdout("[server] Shutdown complete.\n", .{});
     return 0;
 }
@@ -405,17 +403,17 @@ const HttpReadResult = union(enum) {
     closed,
 };
 
-fn read_http_request(fd: i32, buffer: []u8) HttpReadResult {
-    tiger.assert(fd >= 0 and buffer.len > 4096);
+fn read_http_request(fd: tiger.SocketFd, buffer: []u8) HttpReadResult {
+    tiger.assert(tiger.is_valid_socket(fd) and buffer.len > 4096);
     var received: usize = 0;
     var header_end: ?usize = null;
 
     var recv_iter: u32 = 0;
     while (header_end == null and recv_iter < 4096) : (recv_iter += 1) {
         if (received >= 65536) return .{ .bad_request = "HTTP headers exceed 64 KiB limit" };
-        const n: isize = tiger.recv(fd, buffer[received..].ptr, @min(8192, buffer.len - received), 0);
+        const n: isize = tiger.net_recv(fd, buffer[received..].ptr, @min(8192, buffer.len - received));
         if (n <= 0) {
-            if (n < 0 and tiger.get_errno() == tiger.EINTR) continue;
+            if (n < 0 and tiger.net_last_error_is_eintr()) continue;
             return .closed;
         }
         received += @intCast(n);
@@ -488,9 +486,9 @@ fn read_http_request(fd: i32, buffer: []u8) HttpReadResult {
     var body_iter: u32 = 0;
     while (received < body_start + content_len and body_iter < 262144) : (body_iter += 1) {
         const need = body_start + content_len - received;
-        const n: isize = tiger.recv(fd, buffer[received..].ptr, @min(65536, need), 0);
+        const n: isize = tiger.net_recv(fd, buffer[received..].ptr, @min(65536, need));
         if (n <= 0) {
-            if (n < 0 and tiger.get_errno() == tiger.EINTR) continue;
+            if (n < 0 and tiger.net_last_error_is_eintr()) continue;
             return .closed;
         }
         received += @intCast(n);
@@ -508,7 +506,7 @@ fn read_http_request(fd: i32, buffer: []u8) HttpReadResult {
 }
 
 fn handle_connection(
-    fd: i32,
+    fd: tiger.SocketFd,
     engine: *engine_mod.Engine,
     tokenizer: *const tokenizer_mod.Tokenizer,
     config: *const ServerConfig,
@@ -583,7 +581,7 @@ fn handle_connection(
 }
 
 fn handle_chat_completions(
-    fd: i32,
+    fd: tiger.SocketFd,
     body: []const u8,
     engine: *engine_mod.Engine,
     tokenizer: *const tokenizer_mod.Tokenizer,
@@ -871,7 +869,7 @@ fn handle_chat_completions(
     if (!send_chat_sse_delta(fd, buffers.sse_buf, req_id, created, req_model, .role, "assistant", null, null)) return;
 
     const StreamCtx = struct {
-        fd: i32,
+        fd: tiger.SocketFd,
         sse_buf: []u8,
         req_id: []const u8,
         created: i64,
@@ -974,7 +972,7 @@ fn handle_chat_completions(
 }
 
 fn handle_text_completions(
-    fd: i32,
+    fd: tiger.SocketFd,
     body: []const u8,
     engine: *engine_mod.Engine,
     tokenizer: *const tokenizer_mod.Tokenizer,
@@ -1161,7 +1159,7 @@ fn handle_text_completions(
 
     if (!send_sse_headers(fd)) return;
     const StreamCmplCtx = struct {
-        fd: i32,
+        fd: tiger.SocketFd,
         sse_buf: []u8,
         req_id: []const u8,
         created: i64,
@@ -1207,7 +1205,7 @@ fn handle_text_completions(
 const DeltaKind = enum { role, content, reasoning, empty };
 
 fn send_chat_sse_delta(
-    fd: i32,
+    fd: tiger.SocketFd,
     sse_buf: []u8,
     req_id: []const u8,
     created: i64,
@@ -1258,7 +1256,7 @@ fn send_chat_sse_delta(
 }
 
 fn send_chat_sse_tool_calls(
-    fd: i32,
+    fd: tiger.SocketFd,
     sse_buf: []u8,
     req_id: []const u8,
     created: i64,
@@ -1652,14 +1650,14 @@ fn resolve_tool_name_by_id(prior_messages_prefix: []const u8, target_id: []const
 
 // --- Low-Level Socket, UTF-8 & Iterative JSON Field Helpers ---
 
-fn send_all(fd: i32, data: []const u8) bool {
+fn send_all(fd: tiger.SocketFd, data: []const u8) bool {
     var sent: usize = 0;
     var iter: usize = 0;
     const max_iter: usize = data.len + 64;
     while (sent < data.len and iter < max_iter) : (iter += 1) {
-        const n: isize = tiger.send(fd, data[sent..].ptr, data.len - sent, tiger.MSG_NOSIGNAL);
+        const n: isize = tiger.net_send(fd, data[sent..].ptr, data.len - sent);
         if (n <= 0) {
-            if (n < 0 and tiger.get_errno() == tiger.EINTR) continue;
+            if (n < 0 and tiger.net_last_error_is_eintr()) continue;
             return false;
         }
         sent += @intCast(n);
@@ -1667,7 +1665,7 @@ fn send_all(fd: i32, data: []const u8) bool {
     return sent == data.len;
 }
 
-fn send_json_response(fd: i32, status_code: u16, body: []const u8) void {
+fn send_json_response(fd: tiger.SocketFd, status_code: u16, body: []const u8) void {
     const status_text: []const u8 = switch (status_code) {
         200 => "OK",
         400 => "Bad Request",
@@ -1689,7 +1687,7 @@ fn send_json_response(fd: i32, status_code: u16, body: []const u8) void {
     _ = send_all(fd, body);
 }
 
-fn send_error_json(fd: i32, status_code: u16, message: []const u8, err_type: []const u8, buf: []u8) void {
+fn send_error_json(fd: tiger.SocketFd, status_code: u16, message: []const u8, err_type: []const u8, buf: []u8) void {
     var bw = tiger.ByteWriter.init(buf);
     bw.append_slice("{\"error\":{\"message\":");
     bw.append_json_escaped(message);
@@ -1699,7 +1697,7 @@ fn send_error_json(fd: i32, status_code: u16, message: []const u8, err_type: []c
     send_json_response(fd, status_code, bw.slice());
 }
 
-fn send_sse_headers(fd: i32) bool {
+fn send_sse_headers(fd: tiger.SocketFd) bool {
     return send_all(fd, "HTTP/1.1 200 OK\r\n" ++
         "Content-Type: text/event-stream; charset=utf-8\r\n" ++
         "Cache-Control: no-cache\r\n" ++
